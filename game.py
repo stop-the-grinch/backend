@@ -4,6 +4,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import random
 import re
+import json
+from typing import Union
 
 app = FastAPI()
 
@@ -24,26 +26,110 @@ games = {}
 
 
 class GameData:
-    def __init__(self, id):
-        self.id = id
-        self.p1 = None
+    def __init__(self, id, creator):
+        self.id = str(id)
+        self.state = "LOBBY"
+        self.creator = str(creator)
+        self.p1 = str(creator)
+        self.p1FriendlyName = uuid_to_name(creator)
         self.p2 = None
+        self.p2FriendlyName = None
 
 
 def new_uuid():
     return UUID(bytes=os.urandom(16), version=4)
 
 
-@app.get("/api/creategame")
-async def create_game():
+@app.post("/api/create-game/{player_uuid}")
+async def create_game(player_uuid: UUID):
+    existing_lobby = await does_player_lobby_exist(player_uuid)
+
+    if existing_lobby:
+        raise HTTPException(
+            status_code=403, detail=f"You have an existing lobby: {existing_lobby}"
+        )
     game_id = str(random.randint(100000, 999999))
 
     while game_id in games:
         game_id = str(random.randint(100000, 999999))
 
-    games[game_id] = GameData(game_id)
+    # create the game
+    games[game_id] = GameData(game_id, player_uuid)
 
-    return game_id
+    print("New game: " + game_id)
+    await send_to_player(
+        str(player_uuid), games[game_id].__dict__
+    )  # Convert UUID to string
+
+    return {"game_id": game_id}
+
+
+@app.post("/api/start-game/{game_code}")
+async def start_game(game_code: str):
+    if not await does_lobby_exist(game_code):
+        raise HTTPException(
+            status_code=403, detail=f"Can't start -- that lobby doesn't exist!"
+        )
+    game = games[game_code]
+    game.state = "GAME"
+    await send_to_player(game.p1, game.__dict__)
+    await send_to_player(game.p2, game.__dict__)
+    return
+
+
+@app.post("/api/join-game/{player_uuid}/{game_code}")
+async def join_game(player_uuid: UUID, game_code: str):
+    if not await does_lobby_exist(game_code):
+        raise HTTPException(status_code=403, detail=f"That lobby doesn't exist!")
+    # user shouldn't be in any other lobby
+    if await is_player_in_game(player_uuid) != False:
+        raise HTTPException(status_code=403, detail=f"Don't join two games at once!")
+    if games[game_code].p1 is not None and games[game_code].p2 is not None:
+        raise HTTPException(status_code=403, detail=f"That lobby is full!")
+
+    games[game_code].p2 = str(player_uuid)
+    games[game_code].p2FriendlyName = uuid_to_name(player_uuid)
+
+    print("Sending to player " + str(player_uuid))
+    await send_to_player(str(player_uuid), games[game_code].__dict__)
+    await send_to_player(games[game_code].p1, games[game_code].__dict__)
+    return {"game_code": game_code}
+
+
+@app.post("/api/leave-game/{player_uuid}/")
+async def leave_button(player_uuid: UUID):
+    game_id = await is_player_in_game(player_uuid)
+    if not game_id:
+        raise HTTPException(status_code=403, detail="You're not in a game! Refresh?")
+
+    game = games[game_id]
+
+    if str(player_uuid) == game.p1:
+        await send_to_player(UUID(game.p1), None)
+
+        if game.p2:
+            game.p1 = game.p2
+            game.p1FriendlyName = game.p2FriendlyName
+            game.p2 = None
+            game.p2FriendlyName = None
+        else:
+            del games[game_id]
+            return
+
+    elif str(player_uuid) == game.p2:
+        await send_to_player(UUID(game.p2), None)
+
+        game.p2 = None
+        game.p2FriendlyName = None
+    else:
+        raise HTTPException(status_code=403, detail="You're not part of this game!")
+
+    if game.p1:
+        await send_to_player(game.p1, game.__dict__)
+    if game.p2:
+        await send_to_player(game.p2, game.__dict__)
+
+    return
 
 
 @app.get("/api/join/{game_code}")
@@ -99,33 +185,73 @@ async def demo_send(identifier: str, message: str):
     return {"status": result}
 
 
-async def send_to_player(identifier: str, message: str):
+async def does_player_lobby_exist(uuid):
+    for game in games.values():
+        if game.creator == str(uuid):
+            return game.id
+    return False
+
+
+def uuid_to_name(user_uuid: Union[str, UUID]):
+    if isinstance(user_uuid, str):
+        try:
+            user_uuid = UUID(user_uuid)
+        except ValueError:
+            return None
+    connection = manager.active_connections.get(user_uuid)
+    if connection:
+        return connection["user_name"]
+    else:
+        return None
+
+
+async def does_lobby_exist(code):
+    for game in games.values():
+        if game.id == code:
+            return True
+    return False
+
+
+async def is_player_in_game(player_uuid: UUID):
+    for game in games.values():
+        if (game.p1 and UUID(game.p1) == player_uuid) or (
+            game.p2 and UUID(game.p2) == player_uuid
+        ):
+            return game.id
+    return False
+
+
+async def send_to_player(identifier: Union[str, UUID], message: dict):
     print(f"Sending to identifier: {identifier}")
     try:
-        target_uuid = UUID(identifier)
+        if isinstance(identifier, UUID):
+            target_uuid = identifier
+        else:
+            target_uuid = UUID(identifier)
         connection = manager.active_connections.get(target_uuid)
         if connection:
-            await manager.send_message(message, connection["websocket"])
+            # Convert UUIDs in the message to strings
+            serialized_message = json.dumps(
+                message, default=lambda o: str(o) if isinstance(o, UUID) else o
+            )
+            await manager.send_message(serialized_message, connection["websocket"])
             return f"Message sent to user with UUID: {identifier}"
     except ValueError:
         pass
 
-    target_uuid, websocket = manager.find_by_name(identifier)
+    target_uuid, websocket = manager.find_by_name(str(identifier))
     if websocket:
-        await manager.send_message(message, websocket)
+        serialized_message = json.dumps(
+            message, default=lambda o: str(o) if isinstance(o, UUID) else o
+        )
+        await manager.send_message(serialized_message, websocket)
         return f"Message sent to user with name: {identifier}"
 
     return f"User with identifier '{identifier}' not found."
 
 
 @app.websocket("/ws/{user_uuid}/{user_name}")
-async def websocket_endpoint(websocket: WebSocket, user_uuid: str, user_name: str):
-    try:
-        user_uuid = UUID(user_uuid)
-    except ValueError:
-        await websocket.close(code=1003)
-        raise HTTPException(status_code=400, detail="Invalid UUID")
-
+async def websocket_endpoint(websocket: WebSocket, user_uuid: UUID, user_name: str):
     if (
         not user_name
         or len(user_name) > 20
@@ -136,12 +262,17 @@ async def websocket_endpoint(websocket: WebSocket, user_uuid: str, user_name: st
     await manager.connect(websocket, user_uuid, user_name)
     print(f"User {user_uuid} (named {user_name}) connected.")
 
+    game_id = await is_player_in_game(user_uuid)
+
+    print("USER!! " + str(game_id))
+
+    if game_id:
+        await send_to_player(user_uuid, games[game_id].__dict__)
+
     try:
         while True:
             data = await websocket.receive_text()
-            # THIS IS HOW WE GET DATA BACK FROM THE USER & PARSE IT: VV
             print(f"User {user_uuid} (named {user_name}) sent: {data}")
-            await manager.send_message(f"Message from {user_name}: {data}", websocket)
     except WebSocketDisconnect:
         manager.disconnect(user_uuid)
         print(f"User {user_uuid} (named {user_name}) disconnected.")
